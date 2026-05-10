@@ -1,0 +1,14 @@
+services:
+  security-vault:
+    build: .
+    container_name: security-vault
+    ports:
+      - "8000:8000"
+    environment:
+      SECRET_STORAGE_PATH: "/data/secrets.db"
+      SECRET_API_KEYS: '{"admin-token":"admin","writer-token":"writer","reader-token":"reader"}'
+    volumes:
+      - vault-data:/data
+
+volumes:
+  vault-data:
