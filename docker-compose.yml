@@ -6,7 +6,7 @@ services:
       - "8000:8000"
     environment:
       SECRET_STORAGE_PATH: "/data/secrets.db"
-      SECRET_API_KEYS: '{"admin-token":"admin","writer-token":"writer","reader-token":"reader"}'
+      SECRET_API_KEYS: '{"sha256:10a4c7c9fc5206d6f36dc6944a81bb6f4a3cb0e25014ae3b12e6c3e52712292a":"admin","sha256:3590c0a59f72ce02700194a05f228a725c1f135a6dcb3ded9b2d86ab6a6f52cb":"writer","sha256:ba5005a40cf5212e4ac0190104cc127edab013294bb71279a975b27a80982d45":"reader"}'
     volumes:
       - vault-data:/data
 

@@ -26,6 +26,11 @@ def derive_master_key(child_keys: list[str]) -> bytes:
     return digest
 
 
+def derive_master_key_verifier(master_key: bytes) -> str:
+    verifier = hmac.new(master_key, b"vault-unseal-verifier-v1", hashlib.sha256).digest()
+    return b64encode(verifier)
+
+
 def _keystream(key: bytes, nonce: bytes, length: int) -> bytes:
     blocks = []
     counter = 0

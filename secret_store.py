@@ -5,7 +5,16 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from secret_crypto import b64decode, b64encode, decrypt, derive_master_key, encrypt, sign_token, verify_token
+from secret_crypto import (
+    b64decode,
+    b64encode,
+    decrypt,
+    derive_master_key,
+    derive_master_key_verifier,
+    encrypt,
+    sign_token,
+    verify_token,
+)
 
 
 class SecretStore:
@@ -79,6 +88,21 @@ class SecretStore:
             rows = connection.execute("SELECT key, value FROM meta").fetchall()
         return {str(row["key"]): str(row["value"]) for row in rows}
 
+    def is_initialized(self) -> bool:
+        meta = self._get_meta()
+        return "master_key_verifier" in meta
+
+    def initialize(self, child_keys: List[str]) -> None:
+        with self._lock:
+            if self.is_initialized():
+                raise ValueError("vault is already initialized")
+            master_key = derive_master_key(child_keys)
+            self._set_meta("master_key_verifier", derive_master_key_verifier(master_key))
+            self.master_key = master_key
+            self._set_meta("status", "unsealed")
+            self._set_meta("initialized_at", str(int(time.time())))
+            self._set_meta("last_unsealed_at", str(int(time.time())))
+
     def seal(self) -> None:
         with self._lock:
             self.master_key = None
@@ -86,7 +110,14 @@ class SecretStore:
 
     def unseal(self, child_keys: List[str]) -> None:
         with self._lock:
-            self.master_key = derive_master_key(child_keys)
+            if not self.is_initialized():
+                raise ValueError("vault is not initialized")
+            candidate_key = derive_master_key(child_keys)
+            expected_verifier = self._get_meta().get("master_key_verifier")
+            actual_verifier = derive_master_key_verifier(candidate_key)
+            if expected_verifier != actual_verifier:
+                raise ValueError("invalid child keys")
+            self.master_key = candidate_key
             self._set_meta("status", "unsealed")
             self._set_meta("last_unsealed_at", str(int(time.time())))
 
@@ -206,6 +237,7 @@ class SecretStore:
 
             return {
                 "sealed": self.is_sealed(),
+                "initialized": self.is_initialized(),
                 "secret_count": len(self.list_secrets()),
                 "meta": normalized_meta,
             }

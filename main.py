@@ -1,5 +1,6 @@
 import json
 import os
+import hashlib
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Callable, Dict, List
@@ -12,7 +13,14 @@ from secret_store import SecretStore
 
 DEFAULT_STORAGE_PATH = os.getenv("SECRET_STORAGE_PATH", "./data/secrets.db")
 DEFAULT_API_TOKEN = os.getenv("SECRET_API_TOKEN", "change-me-admin")
-DEFAULT_API_KEYS = json.dumps({DEFAULT_API_TOKEN: "admin"})
+
+
+def hash_api_key(token: str) -> str:
+    digest = hashlib.sha256(token.encode("utf-8")).hexdigest()
+    return f"sha256:{digest}"
+
+
+DEFAULT_API_KEYS = json.dumps({hash_api_key(DEFAULT_API_TOKEN): "admin"})
 
 
 class UnsealRequest(BaseModel):
@@ -49,18 +57,23 @@ def load_api_keys() -> Dict[str, str]:
 
     allowed_roles = {"admin", "writer", "reader"}
     api_keys: Dict[str, str] = {}
-    for token, role in parsed.items():
-        if not isinstance(token, str) or not token.strip():
-            raise RuntimeError("SECRET_API_KEYS contains an empty API key")
+    for token_hash, role in parsed.items():
+        if not isinstance(token_hash, str) or not token_hash.strip():
+            raise RuntimeError("SECRET_API_KEYS contains an empty API key hash")
+        if not token_hash.startswith("sha256:"):
+            raise RuntimeError("SECRET_API_KEYS keys must use sha256:<hex> format")
+        digest = token_hash.removeprefix("sha256:")
+        if len(digest) != 64 or any(char not in "0123456789abcdef" for char in digest):
+            raise RuntimeError("SECRET_API_KEYS contains an invalid sha256 hash")
         if role not in allowed_roles:
             raise RuntimeError("SECRET_API_KEYS contains an unsupported role")
-        api_keys[token] = role
+        api_keys[token_hash] = role
     return api_keys
 
 
 def require_role(api_keys: Dict[str, str], allowed_roles: set[str]) -> Callable[[str], AuthContext]:
     def dependency(x_api_key: str = Header(..., alias="X-API-Key")) -> AuthContext:
-        role = api_keys.get(x_api_key)
+        role = api_keys.get(hash_api_key(x_api_key))
         if role is None:
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
@@ -114,6 +127,14 @@ def create_app() -> FastAPI:
     def get_status(_: AuthContext = Depends(require_admin)) -> dict:
         return store.status()
 
+    @app.post("/v1/init")
+    def initialize_store(payload: UnsealRequest, _: AuthContext = Depends(require_admin)) -> dict:
+        try:
+            store.initialize(payload.child_keys)
+            return {"status": "initialized"}
+        except Exception as exc:
+            _raise_http_error(exc)
+
     @app.get("/v1/whoami")
     def whoami(context: AuthContext = Depends(require_reader)) -> dict:
         return {"role": context.role}
@@ -159,7 +180,7 @@ def create_app() -> FastAPI:
             _raise_http_error(exc)
 
     @app.post("/v1/unwrap")
-    def unwrap_secret(payload: TokenRequest, _: AuthContext = Depends(require_reader)) -> dict:
+    def unwrap_secret(payload: TokenRequest) -> dict:
         try:
             return store.unwrap_secret(payload.token)
         except Exception as exc:

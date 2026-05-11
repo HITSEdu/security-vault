@@ -40,11 +40,11 @@
 
 Само значение секрета на диск в открытом виде не пишется.
 
-### 2. Unseal
+### 2. Init / Unseal
 
-Сервис после старта находится в состоянии `sealed`.
+Сервис после старта находится в состоянии `sealed`, но до первой инициализации он еще и `not initialized`.
 
-Чтобы открыть доступ к секретам, нужно вызвать `POST /v1/unseal` и передать несколько дочерних ключей:
+Сначала администратор один раз вызывает `POST /v1/init` и передает набор дочерних ключей:
 
 ```json
 {
@@ -52,7 +52,15 @@
 }
 ```
 
-Из них в памяти процесса вычисляется мастер-ключ. После `POST /v1/seal` ключ удаляется из памяти.
+Из них вычисляется мастер-ключ, а в `meta` сохраняется только verifier этого ключа. Сам набор `child_keys`
+сервис не хранит.
+
+После `POST /v1/seal` мастер-ключ удаляется из памяти. Чтобы снова открыть vault, нужно вызвать
+`POST /v1/unseal` с тем же набором `child_keys`. Сервис заново вычислит мастер-ключ и сравнит его verifier
+с сохраненным значением.
+
+Если vault не был инициализирован, `unseal` вернет ошибку `vault is not initialized`.
+Если передан другой набор `child_keys`, `unseal` вернет `invalid child keys`.
 
 ### 3. Шифрование
 
@@ -67,7 +75,7 @@
 
 ### 4. Wrap / unwrap
 
-`POST /v1/secrets/{name}/wrap` выдает токен со сроком жизни.
+`POST /v1/secrets/{name}/wrap` выдает токен со сроком жизни. Эндпоинт доступен `admin` и `writer`.
 
 Токен содержит:
 
@@ -75,25 +83,38 @@
 - время выдачи
 - `exp`
 
-Токен подписывается мастер-ключом. `POST /v1/unwrap` проверяет подпись и TTL, затем возвращает секрет.
+Токен подписывается мастер-ключом. `POST /v1/unwrap` не требует API-ключа: он проверяет подпись и TTL, затем возвращает секрет только по самому токену.
 
 ### 5. RBAC
 
-Доступ задается через переменную окружения `SECRET_API_KEYS` в виде JSON-объекта:
+Доступ задается через переменную окружения `SECRET_API_KEYS` в виде JSON-объекта, где ключом является `sha256`-хэш API-токена, а значением - роль:
 
 ```json
 {
-  "admin-token": "admin",
-  "writer-token": "writer",
-  "reader-token": "reader"
+  "sha256:10a4c7c9fc5206d6f36dc6944a81bb6f4a3cb0e25014ae3b12e6c3e52712292a": "admin",
+  "sha256:3590c0a59f72ce02700194a05f228a725c1f135a6dcb3ded9b2d86ab6a6f52cb": "writer",
+  "sha256:ba5005a40cf5212e4ac0190104cc127edab013294bb71279a975b27a80982d45": "reader"
 }
+```
+
+Сам клиент по-прежнему отправляет обычный токен в `X-API-Key`. Сервис на своей стороне считает `sha256` и ищет совпадение в `SECRET_API_KEYS`.
+
+Посчитать хэш токена можно так:
+
+```bash
+python3 - <<'PY'
+import hashlib
+token = "admin-token"
+print("sha256:" + hashlib.sha256(token.encode()).hexdigest())
+PY
 ```
 
 Матрица прав:
 
-- `admin` - `status`, `unseal`, `seal`, чтение, запись, `wrap`, `unwrap`
-- `writer` - чтение, запись, `wrap`, `unwrap`
-- `reader` - чтение, список секретов, `unwrap`, `whoami`
+- `admin` - `status`, `init`, `unseal`, `seal`, чтение, запись, `wrap`
+- `writer` - чтение, запись, `wrap`
+- `reader` - чтение, список секретов, `whoami`
+- `unwrap` - доступен без API-ключа, если есть валидный wrap-токен
 
 Есть обратная совместимость: если `SECRET_API_KEYS` не задан, используется старый `SECRET_API_TOKEN` как `admin`.
 
@@ -128,7 +149,9 @@ cp .env.example .env
 python3 -m venv .venv
 . .venv/bin/activate
 pip install -r requirements.txt
-export $(grep -v '^#' .env | xargs)
+set -a
+. ./.env
+set +a
 uvicorn main:app --reload
 ```
 
@@ -136,7 +159,7 @@ uvicorn main:app --reload
 
 ```env
 SECRET_STORAGE_PATH=./data/secrets.db
-SECRET_API_KEYS={"admin-token":"admin","writer-token":"writer","reader-token":"reader"}
+SECRET_API_KEYS='{"sha256:10a4c7c9fc5206d6f36dc6944a81bb6f4a3cb0e25014ae3b12e6c3e52712292a":"admin","sha256:3590c0a59f72ce02700194a05f228a725c1f135a6dcb3ded9b2d86ab6a6f52cb":"writer","sha256:ba5005a40cf5212e4ac0190104cc127edab013294bb71279a975b27a80982d45":"reader"}'
 ```
 
 ### Старый режим с одним ключом
@@ -166,7 +189,7 @@ docker compose up --build
 Переменные окружения:
 
 - `SECRET_STORAGE_PATH` - путь к SQLite-файлу
-- `SECRET_API_KEYS` - JSON-объект с API-ключами и ролями
+- `SECRET_API_KEYS` - JSON-объект вида `sha256:<hex> -> role`
 - `SECRET_API_TOKEN` - legacy fallback для одного `admin` ключа
 
 ## Как проверить, что все работает
@@ -215,7 +238,31 @@ curl -X PUT http://localhost:8000/v1/secrets/db_password \
 
 Ожидаемо будет ошибка `store is sealed`.
 
-### 4. Сделать unseal
+### 4. Инициализировать vault
+
+```bash
+curl -X POST http://localhost:8000/v1/init \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: admin-token" \
+  -d '{"child_keys":["share-1","share-2","share-3"]}'
+```
+
+Ожидаемый ответ:
+
+```json
+{"status":"initialized"}
+```
+
+### 5. Сделать unseal
+
+Сначала можно явно запечатать vault:
+
+```bash
+curl -X POST http://localhost:8000/v1/seal \
+  -H "X-API-Key: admin-token"
+```
+
+Затем открыть его снова:
 
 ```bash
 curl -X POST http://localhost:8000/v1/unseal \
@@ -230,7 +277,7 @@ curl -X POST http://localhost:8000/v1/unseal \
 {"status":"unsealed"}
 ```
 
-### 5. Записать секрет
+### 6. Записать секрет
 
 ```bash
 curl -X PUT http://localhost:8000/v1/secrets/db_password \
@@ -239,21 +286,21 @@ curl -X PUT http://localhost:8000/v1/secrets/db_password \
   -d '{"value":"super-secret-password"}'
 ```
 
-### 6. Прочитать секрет
+### 7. Прочитать секрет
 
 ```bash
 curl http://localhost:8000/v1/secrets/db_password \
   -H "X-API-Key: reader-token"
 ```
 
-### 7. Проверить список секретов
+### 8. Проверить список секретов
 
 ```bash
 curl http://localhost:8000/v1/secrets \
   -H "X-API-Key: reader-token"
 ```
 
-### 8. Проверить wrap / unwrap
+### 9. Проверить wrap / unwrap
 
 Создать токен:
 
@@ -269,11 +316,10 @@ curl -X POST http://localhost:8000/v1/secrets/db_password/wrap \
 ```bash
 curl -X POST http://localhost:8000/v1/unwrap \
   -H "Content-Type: application/json" \
-  -H "X-API-Key: reader-token" \
   -d '{"token":"PASTE_TOKEN_HERE"}'
 ```
 
-### 9. Проверить RBAC-ограничения
+### 10. Проверить RBAC-ограничения
 
 `reader` не должен уметь писать:
 
@@ -302,7 +348,7 @@ curl http://localhost:8000/v1/status \
   -H "X-API-Key: admin-token"
 ```
 
-### 10. Проверить seal
+### 11. Проверить seal
 
 ```bash
 curl -X POST http://localhost:8000/v1/seal \
